@@ -1,0 +1,39 @@
+[project]
+name = "browseruse"
+version = "0.1.0"
+description = "Drive your own Brave or Chrome by chat. Claude plans, Jev gates every action."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.0.0",
+    "typesafe-sdk>=0.7.0",
+    "playwright>=1.48",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+voice = [
+    # Placeholder for the speech layer. Nothing here is imported yet; the
+    # voice/ package defines the interfaces a backend has to satisfy.
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4.6",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+browseruse = "browseruse.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/browseruse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
