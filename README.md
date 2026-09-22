@@ -145,6 +145,61 @@ src/browseruse/
 └── voice/              interfaces only, for now
 ```
 
+## What leaves your machine
+
+Worth being precise about, since this thing reads your logged-in pages.
+
+**Two destinations, both of them API calls you are paying for.** There is no
+telemetry, no analytics, no crash reporting, no phone-home. The only hardcoded
+network address in the source is `http://127.0.0.1`, the debugging port on your
+own machine. Nothing is written to disk except the browser profile itself —
+the conversation lives in memory and dies with the process.
+
+**On every step, Claude receives:** the page URL and title, the numbered
+element list (labels, roles, link targets), up to 4000 characters of the page's
+visible text, and your instruction.
+
+**On every step, Jev receives:** the URL and title, up to 2000 characters of
+visible text, and element labels. For a risk score it also gets the action and
+its arguments.
+
+So: whatever is on the pages you point it at goes to Anthropic and TypeSafe,
+the same way it would with any browser agent. If a page is confidential, do not
+point it at that page. What each provider does with it afterwards is governed
+by their terms, not by this code.
+
+### What is held back
+
+Password, card-number, CVV and one-time-code fields are detected three ways —
+the input `type`, the `autocomplete` hint your browser uses to autofill, and
+the field's name, id, placeholder or label — and **their contents are never
+captured**. The agent is told `(sensitive field, already filled)` so it can
+still reason about the form; it cannot see what is in it.
+
+The refusal to type into such a field happens *before* the risk call, not
+after. That ordering is the whole point: scoring the action would have
+transmitted the secret. Same for one-time codes mentioned in the text itself.
+
+`tests/test_no_secret_leaks.py` pins this shut: it loads a login page with a
+filled-in password, card number and CVV, and asserts none of the three appear
+in anything bound for either model.
+
+**What is not redacted:** ordinary form values, including email addresses and
+usernames, because the agent genuinely needs them ("which account am I signed
+into?"). Visible page text is sent as-is.
+
+### Your browser and your logins
+
+With `--real-profile` the agent is inside your logged-in session and can act as
+you on any site you are signed into. That is the feature. The safety gate is
+what stands between that and something you did not want: a hard blocklist for
+payments, transfers and deletions that ignores the risk score entirely, then
+the score itself. Extensions, cookies and history behave exactly as normal —
+nothing here modifies them.
+
+Without `--real-profile` it uses a separate profile under `~/.browseruse/`,
+which starts with no logins at all.
+
 ## Tests
 
 ```bash
@@ -152,12 +207,13 @@ pip install -e ".[dev]"
 pytest
 ```
 
-66 tests. The DOM and action tests drive a real headless Chromium against
+83 tests. The DOM and action tests drive a real headless Chromium against
 `tests/fixtures/shop.html` and are skipped if no Chromium is installed; the Jev
 tests run against a mocked API and assert the wire shapes (including that the
 element `Choice` never exceeds 255 labels); the loop tests run the full
 orchestration against a scripted Claude and a fake browser, covering the
-approval gate, declined actions, Jev outages and stale-index recovery.
+approval gate, declined actions, Jev outages and stale-index recovery; and
+`test_no_secret_leaks.py` asserts that no credential reaches either model.
 
 ## Known limits
 

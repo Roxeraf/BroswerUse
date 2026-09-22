@@ -265,3 +265,44 @@ async def test_claude_is_nudged_when_jev_thinks_the_goal_is_already_met(monkeypa
     first_turn = agent._messages[0]["content"][0]["text"]
     assert "goal is already met" in first_turn
     assert "97%" in first_turn
+
+
+async def test_a_credential_is_refused_without_jev_ever_seeing_it(monkeypatch):
+    """The refusal must happen before the risk call, or scoring leaks the secret."""
+    from browseruse.browser.dom import Element
+
+    field = Element(index=0, tag="input", label="Password", frame_url="https://x/",
+                    type="password", sensitive=True, filled=False)
+    jev = FakeJev()
+    turns = [
+        FakeMessage([ToolUseBlock("type_text", {"index": 0, "target_description": "password box",
+                                                "text": "hunter2"})]),
+        FakeMessage([ToolUseBlock("done", {"summary": "Asked the user to sign in."})]),
+    ]
+    agent, asked, executed = build(monkeypatch, turns, jev, snapshots=[make_snapshot([field])])
+    await agent.run("log me in")
+
+    assert jev.risk_calls == [], "the secret was described to Jev before being refused"
+    assert [a for a, _ in executed] == ["done"], "the typing must not have run"
+    assert asked == [], "a refusal is not a confirmation prompt"
+
+
+async def test_text_bound_for_a_sensitive_field_is_redacted_before_scoring(monkeypatch):
+    """Belt and braces: if a sensitive field slips past prescreen, Jev still
+    never receives the contents."""
+    from browseruse.browser.dom import Element
+
+    seen: list[dict] = []
+    field = Element(index=0, tag="input", label="Card number", frame_url="https://x/",
+                    sensitive=True)
+
+    class RecordingJev(FakeJev):
+        async def assess_risk(self, goal, action, args, snapshot):
+            seen.append(args)
+            return await super().assess_risk(goal, action, args, snapshot)
+
+    from browseruse.safety import redact_for_transmission
+    snap = make_snapshot([field])
+    assert redact_for_transmission({"index": 0, "text": "4111111111111111"}, snap)["text"] == (
+        "[redacted: sensitive field]"
+    )

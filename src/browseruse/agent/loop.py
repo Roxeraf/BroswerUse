@@ -15,7 +15,7 @@ from browseruse.browser import actions as browser_actions
 from browseruse.browser.dom import PageSnapshot
 from browseruse.browser.session import BrowserSession
 from browseruse.config import Config
-from browseruse.safety import Decision, Judgement, judge
+from browseruse.safety import Decision, Judgement, judge, prescreen, redact_for_transmission
 
 #: Below this, Jev's element pick is not trusted over Claude's own index.
 REPICK_CONFIDENCE = 0.55
@@ -200,12 +200,25 @@ class BrowserAgent:
             if note:
                 self._report("info", note)
 
+        # Refuse outright before the action is described to any remote model:
+        # scoring a request to type a password would transmit the password.
+        refusal = prescreen(action, args, snapshot)
+        if refusal is not None:
+            self._report("block", refusal.reason)
+            return (
+                StepRecord(action, args, f"Blocked: {refusal.reason}", None, False),
+                f"Blocked and not carried out. {refusal.reason}",
+                None,
+            )
+
         risk_score: float | None = None
         risk_explanation: str | None = None
         if action not in browser_actions.READ_ONLY_ACTIONS and action != "done":
             if self._jev is not None:
                 try:
-                    verdict = await self._jev.assess_risk(goal, action, args, snapshot)
+                    verdict = await self._jev.assess_risk(
+                        goal, action, redact_for_transmission(args, snapshot), snapshot
+                    )
                     risk_score = verdict.score
                     risk_explanation = verdict.explain()
                 except JevUnavailable as exc:

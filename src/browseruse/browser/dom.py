@@ -34,6 +34,25 @@ _EXTRACT_JS = """
     stale.removeAttribute(attribute);
   }
 
+  // Fields whose contents must never reach a model. Detected three ways,
+  // because sites label these inconsistently: the input type, the
+  // autocomplete hint the browser itself uses to autofill, and the name /
+  // id / placeholder text.
+  const SENSITIVE_AUTOCOMPLETE =
+    /cc-number|cc-csc|cc-exp|current-password|new-password|one-time-code/i;
+  const SENSITIVE_HINT =
+    /pass|pwd|card.?num|cardnumber|cvv|cvc|ccv|secur|iban|sort.?code|account.?number|routing|ssn|social.?security|otp|2fa|mfa|totp|token|secret|\\bpin\\b|seed|mnemonic|private.?key/i;
+
+  const isSensitive = (el) => {
+    if (el.type === 'password') return true;
+    if (SENSITIVE_AUTOCOMPLETE.test(el.getAttribute('autocomplete') || '')) return true;
+    const hints = [
+      el.getAttribute('name'), el.id,
+      el.getAttribute('placeholder'), el.getAttribute('aria-label'),
+    ].filter(Boolean).join(' ');
+    return SENSITIVE_HINT.test(hints);
+  };
+
   const isVisible = (el, rect) => {
     if (rect.width < 2 || rect.height < 2) return false;
     const style = window.getComputedStyle(el);
@@ -57,7 +76,7 @@ _EXTRACT_JS = """
     return (hit === el || el.contains(hit) || hit.contains(el)) ? 'hit' : 'covered';
   };
 
-  const describe = (el) => {
+  const describe = (el, sensitive) => {
     const pick = (...values) => {
       for (const value of values) {
         if (typeof value === 'string' && value.trim()) return value.trim();
@@ -70,7 +89,7 @@ _EXTRACT_JS = """
       el.getAttribute('title'),
       el.getAttribute('alt'),
       (el.innerText || '').slice(0, 200),
-      el.value,
+      sensitive ? '' : el.value,
       el.getAttribute('name'),
       el.getAttribute('aria-labelledby') &&
         (document.getElementById(el.getAttribute('aria-labelledby')) || {}).innerText,
@@ -87,14 +106,19 @@ _EXTRACT_JS = """
     const reach = isReachable(el, rect);
     if (reach === 'covered') continue;
 
+    const sensitive = isSensitive(el);
     el.setAttribute(attribute, String(index));
     results.push({
       index,
       tag: el.tagName.toLowerCase(),
       type: el.getAttribute('type') || '',
       role: el.getAttribute('role') || '',
-      label: describe(el),
-      value: typeof el.value === 'string' ? el.value.slice(0, 120) : '',
+      label: describe(el, sensitive),
+      // A sensitive field's contents never leave the page: the agent is told
+      // the field exists and whether it is filled, and nothing more.
+      value: (!sensitive && typeof el.value === 'string') ? el.value.slice(0, 120) : '',
+      sensitive,
+      filled: typeof el.value === 'string' && el.value.length > 0,
       href: (el.getAttribute('href') || '').slice(0, 300),
       checked: el.checked === true,
       in_viewport: reach === 'hit',
@@ -138,6 +162,10 @@ class Element:
     href: str = ""
     checked: bool = False
     in_viewport: bool = True
+    #: A password, card or one-time-code field. Its contents are never captured.
+    sensitive: bool = False
+    #: Whether a sensitive field already has something in it.
+    filled: bool = False
 
     def describe(self) -> str:
         """One line, short enough that 255 of them still fit in a prompt."""
@@ -145,7 +173,9 @@ class Element:
         parts = [f"[{self.index}]", kind]
         if self.label:
             parts.append(f'"{self.label}"')
-        if self.value and self.value != self.label:
+        if self.sensitive:
+            parts.append("(sensitive field, already filled)" if self.filled else "(sensitive field, empty)")
+        elif self.value and self.value != self.label:
             parts.append(f"(value: {self.value})")
         if self.checked:
             parts.append("(checked)")
@@ -224,6 +254,8 @@ async def snapshot(page: Page, *, text_limit: int = 4000) -> PageSnapshot:
                     href=item["href"],
                     checked=item["checked"],
                     in_viewport=item["in_viewport"],
+                    sensitive=item["sensitive"],
+                    filled=item["filled"],
                 )
             )
             frames[item["index"]] = frame

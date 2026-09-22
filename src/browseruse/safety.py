@@ -44,6 +44,46 @@ NEVER_AUTOMATE = re.compile(
 )
 
 
+def prescreen(action: str, args: dict[str, Any], snapshot: PageSnapshot) -> Judgement | None:
+    """The refusal that must happen before the action is described to anyone.
+
+    Risk scoring sends the action and its arguments to Jev. For a credential or
+    a one-time code that is already too late, so this check runs first and, when
+    it fires, nothing about the action leaves the machine.
+    """
+    if action in READ_ONLY_ACTIONS or action == "done":
+        return None
+
+    element = snapshot.element(int(args["index"])) if "index" in args else None
+    if element is not None and element.sensitive and action in {"type_text", "select_option"}:
+        return Judgement(
+            Decision.BLOCK,
+            "That is a password, card or one-time-code field. Fill it in yourself -- "
+            "I will wait and carry on afterwards.",
+        )
+
+    haystack = " ".join(
+        filter(None, [element.describe() if element else "", snapshot.title, str(args.get("text", ""))])
+    )
+    if NEVER_AUTOMATE.search(haystack):
+        return Judgement(
+            Decision.BLOCK,
+            "This involves a credential or one-time code. Do it yourself -- "
+            "I will wait and carry on afterwards.",
+        )
+    return None
+
+
+def redact_for_transmission(args: dict[str, Any], snapshot: PageSnapshot) -> dict[str, Any]:
+    """The form of an action that is safe to describe to a remote model."""
+    element = snapshot.element(int(args["index"])) if "index" in args else None
+    if "text" not in args:
+        return args
+    if element is not None and element.sensitive:
+        return {**args, "text": "[redacted: sensitive field]"}
+    return args
+
+
 @dataclass(frozen=True)
 class Judgement:
     decision: Decision
