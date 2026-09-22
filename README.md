@@ -328,6 +328,49 @@ Which rate you actually get depends on the site, so `/cost` tells you: compare
 
 Prices live in one table, `src/browseruse/agent/cost.py`, if they move.
 
+## Getting it to finish the task
+
+Cost is one axis; whether the run actually completes is the other, and for
+browser agents it is usually the binding one. Two failures were found by
+probing the code rather than reasoning about it, and both were silent — the
+agent carried on believing it had seen the page.
+
+**A page that re-renders after the click.** The settle step waited for
+`domcontentloaded` plus a fixed 0.4s. Anything that fetches and then re-renders
+— which is most of the modern web — landed after that, so the next snapshot
+described the page *as it was before the click*. The agent concludes its click
+did nothing, and either retries it or gives up.
+
+Fixed with a mutation observer installed into every document. But quiescence
+alone is not enough: a page waiting on an XHR is perfectly quiet in the
+meantime, so "no mutations" would return instantly with the stale DOM. The wait
+is therefore in two parts — until the *first* mutation arrives we wait up to a
+1s grace, and after it we wait for 350ms of calm. A page that never settles
+(a clock, a carousel, a long-poll) hits a 4s cap and carries on rather than
+hanging.
+
+**A `target="_blank"` link.** Clicking one opened a tab and left the agent
+staring at the old page. Now the session watches for tabs the page opens for
+itself and switches to the newest one — checked *after* the settle wait,
+because the event arrives after the click returns. Claude is told the tab
+changed.
+
+Measured cost of all that:
+
+| | settle |
+|---|---|
+| click with an instant DOM update | 0.54s |
+| navigate to another page | 0.44s |
+| click that changes nothing (worst case) | 1.16s |
+| snapshot of an 81-element page | 0.03s |
+
+Against a Claude turn of several seconds this is close to free — and it pays
+for itself, because a step wasted on a stale page costs a full turn.
+
+One finding worth repeating: `test_actions.py` used a **stub** session, and
+that stub is precisely what hid the `target="_blank"` bug — it had no concept
+of tabs. Those tests now drive the real `BrowserSession`.
+
 ## Tests
 
 ```bash
@@ -335,7 +378,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-118 tests. The DOM and action tests drive a real headless Chromium against
+124 tests. The DOM and action tests drive a real headless Chromium against
 `tests/fixtures/shop.html` and are skipped if no Chromium is installed; the Jev
 tests run against a mocked API and assert the wire shapes (including that the
 element `Choice` never exceeds 255 labels); the loop tests run the full
@@ -345,6 +388,8 @@ approval gate, declined actions, Jev outages and stale-index recovery; and
 `test_cost.py` pins the billing arithmetic against published rates. The fast
 path has its own tests for every guard: the confidence floors, the consecutive
 cap, read-only mode, and that a risky step never autopilots past the gate.
+`test_settling.py` covers the async re-render, the never-settling page, and the
+new-tab follow.
 
 ## Known limits
 
@@ -354,6 +399,9 @@ cap, read-only mode, and that a risky step never autopilots past the gate.
 
 
 - Cross-origin iframes are not addressable. Same-origin ones are.
+- JavaScript dialogs (`alert`, `confirm`) are auto-dismissed by Playwright.
+  For a `confirm` that means Cancel, which is the safe way round, but a page
+  that depends on one being accepted will not progress.
 - Captchas are not solved, by design. It stops and hands the window back.
 - The element list is viewport-biased: off-screen elements are listed but marked
   `(below the fold)` and need a scroll first.

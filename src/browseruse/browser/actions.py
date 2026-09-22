@@ -41,13 +41,26 @@ def _locator(snapshot: PageSnapshot, session: BrowserSession, index: int):
     return frame.locator(f'[{INDEX_ATTRIBUTE}="{index}"]').first
 
 
-async def _settle(session: BrowserSession, timeout: float = 5.0) -> None:
-    """Give the page a moment to react without hanging on chatty sockets."""
+async def _settle(session: BrowserSession, timeout: float = 5.0) -> str:
+    """Wait for the page to finish reacting, and follow any tab it opened.
+
+    Returns a note for the model when something happened worth knowing about.
+    A fixed sleep used to be enough for server-rendered pages; anything that
+    re-renders after an XHR needs the DOM itself to go quiet, or the next
+    snapshot describes the page as it was before the click.
+    """
     try:
         await session.page.wait_for_load_state("domcontentloaded", timeout=timeout * 1000)
     except PlaywrightError:
         pass
-    await asyncio.sleep(0.4)
+    await session.wait_until_settled()
+    # Checked only now: the page event for a target="_blank" tab arrives after
+    # the click returns, so looking earlier finds nothing.
+    opened = await session.take_new_tab()
+    if opened is not None:
+        await session.wait_until_settled()
+        return f" A new tab opened and I switched to it: {session.page.url}"
+    return ""
 
 
 async def execute(
@@ -57,6 +70,9 @@ async def execute(
     args: dict[str, Any],
 ) -> ActionResult:
     """Run one action. Never raises for ordinary page failures -- it reports them."""
+    # Zero the mutation counter first, so the settle wait afterwards can tell
+    # this action's effects from whatever the page was doing before.
+    await session.mark_pending()
     try:
         return await _dispatch(session, snapshot, action, args)
     except UnknownAction as exc:
@@ -78,13 +94,13 @@ async def _dispatch(
         case "navigate":
             url = str(args["url"])
             await session.goto(url)
-            await _settle(session)
-            return ActionResult(True, f"Opened {session.page.url}")
+            note = await _settle(session)
+            return ActionResult(True, f"Opened {session.page.url}.{note}")
 
         case "go_back":
             await session.page.go_back(wait_until="domcontentloaded")
-            await _settle(session)
-            return ActionResult(True, f"Went back to {session.page.url}")
+            note = await _settle(session)
+            return ActionResult(True, f"Went back to {session.page.url}.{note}")
 
         case "click":
             index = int(args["index"])
@@ -92,9 +108,11 @@ async def _dispatch(
             locator = _locator(snapshot, session, index)
             await locator.scroll_into_view_if_needed(timeout=5000)
             await locator.click(timeout=10000)
-            await _settle(session)
+            note = await _settle(session)
             label = f' "{element.label}"' if element and element.label else ""
-            return ActionResult(True, f"Clicked [{index}]{label}. Now at {session.page.url}")
+            return ActionResult(
+                True, f"Clicked [{index}]{label}. Now at {session.page.url}.{note}"
+            )
 
         case "type_text":
             index = int(args["index"])
@@ -107,8 +125,10 @@ async def _dispatch(
             await locator.type(text, delay=25)
             if args.get("press_enter", False):
                 await locator.press("Enter")
-                await _settle(session)
-                return ActionResult(True, f"Typed into [{index}] and pressed Enter.")
+                note = await _settle(session)
+                return ActionResult(
+                    True, f"Typed into [{index}] and pressed Enter. Now at {session.page.url}.{note}"
+                )
             return ActionResult(True, f"Typed into [{index}].")
 
         case "select_option":
@@ -116,14 +136,14 @@ async def _dispatch(
             value = str(args["value"])
             locator = _locator(snapshot, session, index)
             await locator.select_option(label=value, timeout=5000)
-            await _settle(session)
-            return ActionResult(True, f"Selected {value!r} in [{index}].")
+            note = await _settle(session)
+            return ActionResult(True, f"Selected {value!r} in [{index}].{note}")
 
         case "press_key":
             key = str(args["key"])
             await session.page.keyboard.press(key)
-            await _settle(session)
-            return ActionResult(True, f"Pressed {key}.")
+            note = await _settle(session)
+            return ActionResult(True, f"Pressed {key}.{note}")
 
         case "scroll":
             direction = str(args.get("direction", "down"))

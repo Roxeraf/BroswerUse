@@ -3,36 +3,20 @@
 from __future__ import annotations
 
 import pytest
-from playwright.async_api import async_playwright
 
 from browseruse.browser import actions
-from browseruse.browser.dom import snapshot
-from tests.conftest import FIXTURE_HTML, chromium_path, needs_browser
+from tests.conftest import FIXTURE_HTML, needs_browser
 
 pytestmark = needs_browser
 
 
-class PageSession:
-    """The slice of BrowserSession that actions actually use."""
-
-    def __init__(self, page): self.page = page
-    async def snapshot(self): return await snapshot(self.page)
-    async def goto(self, url):
-        if not url.startswith(("http://", "https://", "file://", "about:")):
-            url = f"https://{url}"
-        await self.page.goto(url, wait_until="domcontentloaded")
-
-
 @pytest.fixture
-async def session():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True, executable_path=chromium_path(), args=["--no-sandbox"]
-        )
-        page = await browser.new_page()
-        await page.goto(FIXTURE_HTML.as_uri())
-        yield PageSession(page)
-        await browser.close()
+async def session(live_session):
+    """The real BrowserSession. A stub here once hid a live bug: it had no
+    notion of tabs the page opens for itself, so nothing noticed that a
+    target="_blank" link left the agent on the old page."""
+    await live_session.page.goto(FIXTURE_HTML.as_uri())
+    return live_session
 
 
 def find(snap, needle):

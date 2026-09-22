@@ -45,3 +45,30 @@ def make_snapshot(elements: list[Element] | None = None, **kwargs) -> PageSnapsh
         text=kwargs.pop("text", "Total EUR 42.00"),
         **kwargs,
     )
+
+
+def free_port() -> int:
+    """A port nothing is listening on, so parallel runs do not collide."""
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+async def live_session(tmp_path, monkeypatch):
+    """A real BrowserSession attached over CDP to a throwaway profile."""
+    from browseruse.browser.session import BrowserSession
+    from browseruse.config import Config
+
+    monkeypatch.setenv("BROWSERUSE_CHROME_PATH", chromium_path() or "")
+    session = BrowserSession(
+        Config(browser="chrome", headless=True, cdp_port=free_port(), state_dir=tmp_path)
+    )
+    await session.start()
+    try:
+        yield session
+    finally:
+        await session.close()
+        session.shutdown_launched_browser()
