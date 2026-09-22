@@ -8,6 +8,7 @@ from typing import Any
 
 import anthropic
 
+from browseruse.agent.cost import CostMeter
 from browseruse.agent.jev import JevAdvisor, JevUnavailable, Observation
 from browseruse.agent.prompts import SYSTEM_PROMPT
 from browseruse.agent.tools import BROWSER_TOOLS
@@ -42,6 +43,8 @@ class RunReport:
     summary: str
     steps: list[StepRecord] = field(default_factory=list)
     stopped_because: str = "done"
+    #: What this one task cost, measured from both APIs' reported usage.
+    cost: CostMeter | None = None
 
 
 class BrowserAgent:
@@ -63,12 +66,17 @@ class BrowserAgent:
         self._report = report
         self._client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
         self._messages: list[dict[str, Any]] = []
+        #: Running spend for the whole session.
+        self.meter = CostMeter(config.model)
+        if jev is not None:
+            jev.meter = self.meter
         self.read_only_mode = False
         #: Mutable at runtime via the CLI's /risk command.
         self.risk_threshold = config.risk_threshold
 
     async def run(self, goal: str) -> RunReport:
         """Pursue ``goal`` until Claude calls done, or the step budget runs out."""
+        before = self.meter.snapshot()
         snapshot = await self._session.snapshot()
         observation = await self._observe(goal, snapshot)
 
@@ -76,6 +84,7 @@ class BrowserAgent:
             return RunReport(
                 summary=self._blocked_message(observation, snapshot),
                 stopped_because="blocked",
+                cost=self.meter.since(before),
             )
 
         self._messages.append(
@@ -93,7 +102,9 @@ class BrowserAgent:
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
                 text = self._text_of(response)
-                return RunReport(text or "(no reply)", steps, stopped_because="end_turn")
+                return RunReport(
+                    text or "(no reply)", steps, "end_turn", self.meter.since(before)
+                )
 
             results: list[dict[str, Any]] = []
             finished: str | None = None
@@ -116,14 +127,15 @@ class BrowserAgent:
                     break
 
             if finished is not None:
-                return RunReport(finished, steps, stopped_because="done")
+                return RunReport(finished, steps, "done", self.meter.since(before))
 
             snapshot = await self._session.snapshot()
             observation = await self._observe(goal, snapshot)
 
             if observation is not None and observation.blocked_on_human:
                 return RunReport(
-                    self._blocked_message(observation, snapshot), steps, stopped_because="blocked"
+                    self._blocked_message(observation, snapshot), steps, "blocked",
+                    self.meter.since(before),
                 )
 
             # The tool results and the fresh page state go back in one user turn.
@@ -135,7 +147,8 @@ class BrowserAgent:
             f"Stopped after {self._config.max_steps} steps without finishing. "
             f"Currently at {snapshot.url}. Tell me how to continue.",
             steps,
-            stopped_because="step_limit",
+            "step_limit",
+            self.meter.since(before),
         )
 
     # -- Claude ----------------------------------------------------------
@@ -152,7 +165,9 @@ class BrowserAgent:
         ) as stream:
             async for text in stream.text_stream:
                 self._report("say", text)
-            return await stream.get_final_message()
+            message = await stream.get_final_message()
+        self.meter.record_claude(message.usage)
+        return message
 
     @staticmethod
     def _text_of(response: Any) -> str:

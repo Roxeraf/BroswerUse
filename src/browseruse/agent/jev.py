@@ -84,8 +84,10 @@ class JevUnavailable(RuntimeError):
 class JevAdvisor:
     """Thin, typed wrapper over ``system_one`` for this agent's four questions."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, meter: Any = None) -> None:
         self._config = config
+        #: Optional CostMeter; every call reports its usage to it.
+        self.meter = meter
         self._client = AsyncTypeSafeClient(
             api_key=config.typesafe_api_key,
             model=config.jev_model,
@@ -194,7 +196,10 @@ class JevAdvisor:
 
     async def _ask(self, state: Any, questions: dict[str, Any]):
         try:
-            return await self._client.system_one(state=state, questions=questions)
+            result = await self._client.system_one(state=state, questions=questions)
         except TypeSafeError as exc:
             # TypeSafeError covers API errors, connection failures and timeouts.
             raise JevUnavailable(str(exc)) from exc
+        if self.meter is not None:
+            self.meter.record_jev(result.usage)
+        return result

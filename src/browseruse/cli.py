@@ -31,6 +31,7 @@ Commands
   /goto <url>        open a URL without involving the agent
   /readonly          toggle read-only mode (every click needs a yes)
   /risk <0-3>        set the confirmation threshold (default 1.5)
+  /cost              what this session has spent so far
   /browser           show which browser is attached
   /help              this text
   /quit              detach and exit
@@ -143,6 +144,10 @@ async def _handle_command(line: str, session: BrowserSession, agent: BrowserAgen
                 console.print(f"  Confirming anything scoring >= [bold]{agent.risk_threshold}[/bold].")
             except ValueError:
                 console.print("[yellow]Usage: /risk <number between 0 and 3>[/yellow]")
+        case "cost":
+            console.print()
+            console.print(Panel(agent.meter.detail(), title="Session spend",
+                                border_style="cyan", expand=False))
         case "browser":
             console.print(
                 f"  {config.browser.title()} on CDP port {config.cdp_port}, "
@@ -215,6 +220,10 @@ async def _run(args: argparse.Namespace) -> int:
         await session.close()
         if jev is not None:
             await jev.aclose()
+        if agent.meter.claude.calls:
+            console.print()
+            console.print(Panel(agent.meter.detail(), title="Session spend",
+                                border_style="cyan", expand=False))
         console.print("\n[dim]Detached. Your browser is still open.[/dim]")
     return 0
 
@@ -231,8 +240,13 @@ async def _do_task(agent: BrowserAgent, goal: str) -> None:
         return
     console.print()
     console.print(Panel(report.summary, border_style="green", expand=False))
+    trailer = []
     if report.steps:
-        console.print(f"[dim]{len(report.steps)} step(s), stopped because: {report.stopped_because}[/dim]")
+        trailer.append(f"{len(report.steps)} step(s), stopped because: {report.stopped_because}")
+    if report.cost is not None and report.cost.claude.calls:
+        trailer.append(f"cost {report.cost.one_line()}")
+    if trailer:
+        console.print(f"[dim]{'  |  '.join(trailer)}[/dim]")
 
 
 def main(argv: list[str] | None = None) -> int:

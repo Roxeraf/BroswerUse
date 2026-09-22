@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -30,9 +30,19 @@ class ToolUseBlock:
 
 
 @dataclass
+class FakeUsage:
+    """The real API reports usage on every turn; so must the double."""
+    input_tokens: int = 40
+    output_tokens: int = 400
+    cache_read_input_tokens: int = 1800
+    cache_creation_input_tokens: int = 200
+
+
+@dataclass
 class FakeMessage:
     content: list[Any]
     stop_reason: str = "tool_use"
+    usage: FakeUsage = field(default_factory=FakeUsage)
 
 
 class FakeStream:
@@ -306,3 +316,31 @@ async def test_text_bound_for_a_sensitive_field_is_redacted_before_scoring(monke
     assert redact_for_transmission({"index": 0, "text": "4111111111111111"}, snap)["text"] == (
         "[redacted: sensitive field]"
     )
+
+
+async def test_every_run_reports_what_it_cost(monkeypatch):
+    turns = [
+        FakeMessage([ToolUseBlock("scroll", {"direction": "down"})]),
+        FakeMessage([ToolUseBlock("done", {"summary": "ok"})]),
+    ]
+    agent, _, _ = build(monkeypatch, turns, FakeJev())
+    report = await agent.run("scroll a bit")
+
+    assert report.cost is not None
+    assert report.cost.claude.calls == 2
+    assert report.cost.total > 0
+    # 2 turns x (40 fresh + 1800 cached + 200 written) input, 400 output each
+    assert report.cost.claude.total_input == 2 * 2040
+    assert report.cost.claude.output_tokens == 800
+
+
+async def test_the_session_total_accumulates_across_tasks(monkeypatch):
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})]) for _ in range(2)]
+    agent, _, _ = build(monkeypatch, turns, FakeJev())
+
+    first = await agent.run("task one")
+    second = await agent.run("task two")
+
+    assert first.cost.claude.calls == second.cost.claude.calls == 1
+    assert agent.meter.claude.calls == 2, "the session meter must keep counting"
+    assert agent.meter.total == pytest.approx(first.cost.total + second.cost.total)

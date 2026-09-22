@@ -82,7 +82,7 @@ browseruse "open my github notifications and summarise them"   # one task, then 
 browseruse --read-only                  # navigate freely, confirm every click
 ```
 
-Commands inside the chat: `/tabs`, `/goto <url>`, `/readonly`, `/risk <0-3>`,
+Commands inside the chat: `/tabs`, `/goto <url>`, `/readonly`, `/risk <0-3>`, `/cost`,
 `/browser`, `/help`, `/quit`.
 
 ### Which profile it uses
@@ -200,6 +200,58 @@ nothing here modifies them.
 Without `--real-profile` it uses a separate profile under `~/.browseruse/`,
 which starts with no logins at all.
 
+## What it costs
+
+Every task prints what it cost, measured from the `usage` both APIs report —
+not estimated. `/cost` shows the session total:
+
+```
+Model: claude-opus-5
+
+  Claude     12 turns     190,800 in /   5,400 out   $0.3923
+           of the input: 162,635 cached (85%), 28,165 written, 0 fresh
+  Jev        24 calls      25,416 in /       0 out   $0.0011
+
+  TOTAL                                                     $0.3934
+
+  Jev is 368x cheaper here.
+```
+
+Rough guide, from measured prompt sizes at Opus 5 rates ($5/$25 per MTok,
+cache reads 0.1x, writes 1.25x):
+
+| Task | Steps | Claude | Jev | Total |
+|---|---|---|---|---|
+| check a page, read something | 3 | $0.08 | $0.0003 | **~$0.08** |
+| search and summarise results | 6 | $0.17 | $0.0005 | **~$0.17** |
+| book a flight, up to the payment form | 12 | $0.39 | $0.0011 | **~$0.39** |
+| long multi-site research | 25 | $0.99 | $0.0022 | **~$0.99** |
+| hits the 40-step budget | 40 | $1.91 | $0.0036 | **~$1.92** |
+
+Jev is **0.3% of the bill**. The gating layer — risk scores, page
+classification, done-checks, element re-matching, two calls per step — costs
+about a tenth of a cent on a twelve-step task. Claude is essentially the
+entire cost.
+
+Cost grows **faster than linearly** with steps, because the whole conversation
+is resent each turn. Prompt caching takes most of the sting out (85% of input
+tokens are cache reads at 0.1x by step 12, and without it that flight booking
+would be $1.09 instead of $0.39) but the curve still bends upward. That is what
+`BROWSERUSE_MAX_STEPS` is protecting you from.
+
+### Making it cheaper
+
+- `BROWSERUSE_MODEL=claude-sonnet-5` — 2.5x cheaper per token. Worth trying;
+  most browser steps are not hard reasoning.
+- Lower `BROWSERUSE_MAX_STEPS` to cap the worst case.
+- Give specific instructions. "Open google.com/travel/flights and search Vienna
+  to Lisbon for 18 Oct" costs a fraction of "book me a flight somewhere warm" —
+  the agent is not paying to explore.
+- Watch the cache hit rate in `/cost`. If it is near zero, something is
+  invalidating the prompt prefix and you are paying full price on every turn.
+
+Prices live in one table, `src/browseruse/agent/cost.py`, if they move.
+
 ## Tests
 
 ```bash
@@ -207,13 +259,14 @@ pip install -e ".[dev]"
 pytest
 ```
 
-83 tests. The DOM and action tests drive a real headless Chromium against
+96 tests. The DOM and action tests drive a real headless Chromium against
 `tests/fixtures/shop.html` and are skipped if no Chromium is installed; the Jev
 tests run against a mocked API and assert the wire shapes (including that the
 element `Choice` never exceeds 255 labels); the loop tests run the full
 orchestration against a scripted Claude and a fake browser, covering the
 approval gate, declined actions, Jev outages and stale-index recovery; and
-`test_no_secret_leaks.py` asserts that no credential reaches either model.
+`test_no_secret_leaks.py` asserts that no credential reaches either model, and
+`test_cost.py` pins the billing arithmetic against published rates.
 
 ## Known limits
 
