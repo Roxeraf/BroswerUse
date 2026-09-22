@@ -100,14 +100,29 @@ class FakeSession:
 
 
 class FakeJev:
-    def __init__(self, *, risk=0.2, page_state="normal", done=0.1, pick=(None, 0.0), fail=False):
+    def __init__(self, *, risk=0.2, page_state="normal", done=0.1, pick=(None, 0.0),
+                 fail=False, needs_text=1.0, propose=None, propose_confidence=0.95):
         self.risk, self.page_state, self.done, self.pick, self.fail = risk, page_state, done, pick, fail
+        self.needs_text = needs_text
+        #: (action, element_index) Jev will propose, or None to always defer.
+        self.propose, self.propose_confidence = propose, propose_confidence
         self.risk_calls: list[str] = []
+        self.observe_calls = 0
+        self.proposals_asked = 0
+        self.meter = None
 
-    async def observe(self, goal, snapshot):
+    async def observe(self, goal, snapshot, *, propose_next=False):
         if self.fail:
             raise JevUnavailable("down")
-        return Observation(self.page_state, 0.95, self.done)
+        self.observe_calls += 1
+        if propose_next:
+            self.proposals_asked += 1
+        action, element = self.propose if (propose_next and self.propose) else ("ask_claude", None)
+        return Observation(
+            self.page_state, 0.95, self.done, self.needs_text,
+            action, self.propose_confidence if propose_next else 0.0,
+            element, self.propose_confidence,
+        )
 
     async def assess_risk(self, goal, action, args, snapshot):
         if self.fail:
@@ -130,9 +145,9 @@ def build(monkeypatch, turns, jev, *, approve=True, snapshots=None, config=None)
 
     snapshots = snapshots or [make_snapshot()]
     session = FakeSession(snapshots)
+    config = config or Config(anthropic_api_key="k", fast_path=False)
     agent = BrowserAgent(
-        config or Config(anthropic_api_key="k"), session, jev,
-        approve=approver, report=lambda kind, text: None,
+        config, session, jev, approve=approver, report=lambda kind, text: None,
     )
     agent._client = FakeClaude(turns)
 
@@ -344,3 +359,108 @@ async def test_the_session_total_accumulates_across_tasks(monkeypatch):
     assert first.cost.claude.calls == second.cost.claude.calls == 1
     assert agent.meter.claude.calls == 2, "the session meter must keep counting"
     assert agent.meter.total == pytest.approx(first.cost.total + second.cost.total)
+
+
+# -- the Jev fast path ---------------------------------------------------
+
+def fast(max_steps=40, **kwargs):
+    return Config(anthropic_api_key="k", fast_path=True, max_steps=max_steps, **kwargs)
+
+
+async def test_jev_takes_obvious_steps_without_waking_claude(monkeypatch):
+    jev = FakeJev(propose=("click", 0))
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, asked, executed = build(monkeypatch, turns, jev, config=fast())
+    report = await agent.run("click through")
+
+    # fast_path_max is 3, so three clicks run before Claude is consulted at all.
+    assert [a for a, _ in executed][:3] == ["click", "click", "click"]
+    assert report.cost.claude.calls == 1, "one Claude turn, not four"
+    assert asked == [], "low-risk autopilot steps do not interrupt the user"
+
+
+async def test_the_fast_path_stops_at_the_confirmation_threshold(monkeypatch):
+    """Autopilot skips Claude, never the safety gate."""
+    jev = FakeJev(propose=("click", 0), risk=2.5)
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, asked, executed = build(monkeypatch, turns, jev, config=fast())
+    await agent.run("buy it")
+
+    assert [a for a, _ in executed] == ["done"], "a risky click must not autopilot"
+    assert asked == [], "and must not ask out of context -- it hands back to Claude"
+
+
+async def test_the_fast_path_respects_read_only_mode(monkeypatch):
+    jev = FakeJev(propose=("click", 0))
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, asked, executed = build(monkeypatch, turns, jev, config=fast())
+    agent.read_only_mode = True
+    await agent.run("look around")
+
+    assert [a for a, _ in executed] == ["done"]
+
+
+async def test_the_fast_path_never_exceeds_its_consecutive_cap(monkeypatch):
+    jev = FakeJev(propose=("scroll", None))
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, _, executed = build(monkeypatch, turns, jev, config=fast(fast_path_max=2))
+    await agent.run("scroll a lot")
+
+    assert [a for a, _ in executed].count("scroll") == 2
+
+
+async def test_autopilot_steps_count_against_the_step_budget(monkeypatch):
+    jev = FakeJev(propose=("scroll", None))
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, _, executed = build(monkeypatch, turns, jev, config=fast(max_steps=2, fast_path_max=5))
+    report = await agent.run("scroll forever")
+
+    assert len(report.steps) <= 2
+
+
+async def test_claude_is_told_what_was_done_in_its_absence(monkeypatch):
+    jev = FakeJev(propose=("click", 0))
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, _, _ = build(monkeypatch, turns, jev, config=fast())
+    await agent.run("click through")
+
+    first_turn = agent._messages[0]["content"][0]["text"]
+    assert "Steps already taken for you" in first_turn
+    assert first_turn.count("click") >= 3
+
+
+async def test_turning_the_fast_path_off_restores_a_claude_turn_per_step(monkeypatch):
+    jev = FakeJev(propose=("click", 0))
+    turns = [
+        FakeMessage([ToolUseBlock("click", {"index": 0, "target_description": "x"})]),
+        FakeMessage([ToolUseBlock("done", {"summary": "ok"})]),
+    ]
+    agent, _, executed = build(monkeypatch, turns, jev, config=Config(
+        anthropic_api_key="k", fast_path=False))
+    report = await agent.run("click once")
+
+    assert jev.proposals_asked == 0, "no point paying for a proposal we will not use"
+    assert report.cost.claude.calls == 2
+
+
+async def test_page_prose_is_withheld_when_jev_says_it_is_not_needed(monkeypatch):
+    long_text = "lorem ipsum " * 400
+    snap = make_snapshot(text=long_text)
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, _, _ = build(monkeypatch, turns, FakeJev(needs_text=0.05),
+                        snapshots=[snap], config=fast())
+    await agent.run("click the basket")
+
+    sent = agent._messages[0]["content"][0]["text"]
+    assert "lorem ipsum" not in sent
+    assert "withheld" in sent and "extract_text" in sent, "Claude must know it can fetch it"
+
+
+async def test_page_prose_is_kept_when_the_goal_needs_reading(monkeypatch):
+    snap = make_snapshot(text="The cheapest fare is EUR 189.")
+    turns = [FakeMessage([ToolUseBlock("done", {"summary": "ok"})])]
+    agent, _, _ = build(monkeypatch, turns, FakeJev(needs_text=0.95),
+                        snapshots=[snap], config=fast())
+    await agent.run("what is the cheapest fare")
+
+    assert "EUR 189" in agent._messages[0]["content"][0]["text"]

@@ -80,6 +80,8 @@ def _reporter(kind: str, text: str) -> None:
         console.print(text, end="", highlight=False, markup=False)
     elif kind == "act":
         console.print(f"  [dim]->[/dim] {text}", highlight=False)
+    elif kind == "auto":
+        console.print(f"  [magenta]~>[/magenta] {text}", highlight=False)
     elif kind == "info":
         console.print(f"  [dim cyan]i {text}[/dim cyan]", highlight=False)
     elif kind == "warn":
@@ -189,7 +191,8 @@ async def _run(args: argparse.Namespace) -> int:
     console.print(
         Panel(
             f"Attached to [bold]{config.browser.title()}[/bold] at {session.page.url}\n"
-            f"Jev: {'on' if jev else 'off'}   "
+            f"Jev: {'on' if jev else 'off'}"
+            f"{' (autopilot)' if jev and config.fast_path else ''}   "
             f"Confirm at risk >= {config.risk_threshold}   "
             f"Read-only: {'on' if agent.read_only_mode else 'off'}\n\n"
             "[dim]/help for commands, /quit to leave.[/dim]",

@@ -203,8 +203,13 @@ class PageSnapshot:
     def frame_for(self, index: int) -> Frame | None:
         return self.frames.get(index)
 
-    def render(self) -> str:
-        """The text block handed to Claude each step."""
+    def render(self, include_text: bool = True) -> str:
+        """The text block handed to Claude each step.
+
+        ``include_text`` drops the prose, which is the bulk of the tokens. The
+        agent is told it was withheld rather than left to think the page is
+        empty, and ``extract_text`` fetches it on demand.
+        """
         lines = [f"URL: {self.url}", f"Title: {self.title}", "", "Interactive elements:"]
         lines.extend(f"  {el.describe()}" for el in self.elements)
         if not self.elements:
@@ -213,8 +218,14 @@ class PageSnapshot:
             lines.append(
                 f"  ... list capped at {MAX_INDEXED_ELEMENTS} elements; scroll to reach the rest"
             )
-        if self.text:
+        if self.text and include_text:
             lines += ["", "Visible text:", self.text]
+        elif self.text:
+            lines += [
+                "",
+                f"Visible text: withheld ({len(self.text)} characters). This page looks "
+                f"navigational; call extract_text if you need to read it.",
+            ]
         return "\n".join(lines)
 
     def choice_labels(self) -> dict[str, str]:

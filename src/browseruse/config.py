@@ -52,6 +52,15 @@ class Config:
     risk_threshold: float = 1.5
     max_steps: int = 40
 
+    #: Let Jev take obvious, low-risk steps without paying for a Claude turn.
+    fast_path: bool = True
+    #: How many Jev-only steps may run back to back before Claude is consulted.
+    fast_path_max: int = 3
+    #: Confidence Jev needs on both the action and the element to act alone.
+    fast_path_confidence: float = 0.80
+    #: Withhold page prose from the prompt when Jev says the step is navigational.
+    trim_page_text: bool = True
+
     state_dir: Path = field(default_factory=lambda: Path.home() / ".browseruse")
 
     @classmethod
@@ -68,6 +77,10 @@ class Config:
             jev_model=os.getenv("BROWSERUSE_JEV_MODEL", "jev-latest"),
             risk_threshold=_num("BROWSERUSE_RISK_THRESHOLD", 1.5),
             max_steps=int(_num("BROWSERUSE_MAX_STEPS", 40)),
+            fast_path=_flag("BROWSERUSE_FAST_PATH", True),
+            fast_path_max=int(_num("BROWSERUSE_FAST_PATH_MAX", 3)),
+            fast_path_confidence=_num("BROWSERUSE_FAST_PATH_CONFIDENCE", 0.80),
+            trim_page_text=_flag("BROWSERUSE_TRIM_TEXT", True),
         )
 
     @property

@@ -87,15 +87,22 @@ class BrowserAgent:
                 cost=self.meter.since(before),
             )
 
+        steps: list[StepRecord] = []
+        snapshot, observation, auto_records, auto_notes = await self._autopilot(
+            goal, snapshot, observation, self._config.max_steps
+        )
+        steps.extend(auto_records)
+
         self._messages.append(
             {
                 "role": "user",
-                "content": self._compose_turn(goal, snapshot, observation, first=True),
+                "content": self._compose_turn(
+                    goal, snapshot, observation, first=True, autopilot=auto_notes
+                ),
             }
         )
 
-        steps: list[StepRecord] = []
-        for _ in range(self._config.max_steps):
+        while len(steps) < self._config.max_steps:
             response = await self._think()
             self._messages.append({"role": "assistant", "content": response.content})
 
@@ -138,9 +145,18 @@ class BrowserAgent:
                     self.meter.since(before),
                 )
 
+            snapshot, observation, auto_records, auto_notes = await self._autopilot(
+                goal, snapshot, observation, self._config.max_steps - len(steps)
+            )
+            steps.extend(auto_records)
+
             # The tool results and the fresh page state go back in one user turn.
             self._messages.append(
-                {"role": "user", "content": results + self._compose_turn(goal, snapshot, observation)}
+                {
+                    "role": "user",
+                    "content": results
+                    + self._compose_turn(goal, snapshot, observation, autopilot=auto_notes),
+                }
             )
 
         return RunReport(
@@ -180,10 +196,72 @@ class BrowserAgent:
         if self._jev is None:
             return None
         try:
-            return await self._jev.observe(goal, snapshot)
+            return await self._jev.observe(
+                goal, snapshot, propose_next=self._config.fast_path
+            )
         except JevUnavailable as exc:
             self._report("warn", f"Jev is unreachable ({exc}); confirming every action instead.")
             return None
+
+    async def _autopilot(
+        self, goal: str, snapshot: PageSnapshot, observation: Observation | None, budget: int
+    ) -> tuple[PageSnapshot, Observation | None, list[StepRecord], list[str]]:
+        """Run the steps Jev is sure about, without paying for a Claude turn.
+
+        Jev cannot generate text, so this only ever covers pure selections:
+        clicking, scrolling, going back. Anything needing a decision or a typed
+        string falls through to Claude, which is the point -- this skips the
+        turns that were never worth one.
+
+        The safety gate is *not* skipped. Autopilot bypasses Claude, not the
+        risk score, and anything that would need your approval stops the run
+        rather than asking for it out of context.
+        """
+        records: list[StepRecord] = []
+        notes: list[str] = []
+        if not self._config.fast_path or observation is None:
+            return snapshot, observation, records, notes
+
+        for _ in range(min(self._config.fast_path_max, budget)):
+            move = observation.autopilot_move(self._config.fast_path_confidence)
+            if move is None:
+                break
+            action, args = move
+
+            if prescreen(action, args, snapshot) is not None:
+                break
+            risk: float | None = None
+            if action not in browser_actions.READ_ONLY_ACTIONS:
+                try:
+                    risk = (await self._jev.assess_risk(goal, action, args, snapshot)).score
+                except JevUnavailable:
+                    break
+            if judge(
+                action=action, args=args, snapshot=snapshot, risk_score=risk,
+                risk_explanation=None, threshold=self.risk_threshold,
+                read_only_mode=self.read_only_mode,
+            ).needs_user:
+                # Confirmations belong to Claude's turn, where the user has the
+                # context to answer. Hand it back rather than interrupting.
+                break
+
+            element = snapshot.element(int(args["index"])) if "index" in args else None
+            result = await browser_actions.execute(self._session, snapshot, action, args)
+            label = f' "{element.label}"' if element and element.label else ""
+            self._report(
+                "auto", f"{action}{label} -- Jev, {observation.next_action_confidence:.0%} sure"
+            )
+            records.append(StepRecord(action, args, result.message, risk, None))
+            notes.append(f"{action}{label}: {result.message}")
+            if not result.ok:
+                break
+
+            snapshot = await self._session.snapshot()
+            observation = await self._observe(goal, snapshot)
+            if observation is None or observation.blocked_on_human:
+                break
+
+        return snapshot, observation, records, notes
 
     async def _resolve_index(
         self, goal: str, snapshot: PageSnapshot, args: dict[str, Any]
@@ -287,11 +365,20 @@ class BrowserAgent:
         observation: Observation | None,
         *,
         first: bool = False,
+        autopilot: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         parts: list[str] = []
         if first:
             parts.append(f"The user asked: {goal}")
-        parts.append(snapshot.render())
+        if autopilot:
+            parts.append(
+                "Steps already taken for you, because the next move was unambiguous:\n"
+                + "\n".join(f"  - {note}" for note in autopilot)
+            )
+        include_text = True
+        if observation is not None and self._config.trim_page_text:
+            include_text = observation.wants_page_text
+        parts.append(snapshot.render(include_text=include_text))
 
         if observation is not None:
             hints: list[str] = []

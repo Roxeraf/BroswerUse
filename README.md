@@ -239,16 +239,92 @@ tokens are cache reads at 0.1x by step 12, and without it that flight booking
 would be $1.09 instead of $0.39) but the curve still bends upward. That is what
 `BROWSERUSE_MAX_STEPS` is protecting you from.
 
-### Making it cheaper
+### Where the money actually goes
 
-- `BROWSERUSE_MODEL=claude-sonnet-5` — 2.5x cheaper per token. Worth trying;
-  most browser steps are not hard reasoning.
+Not where you would guess. On that twelve-step booking:
+
+| | tokens | cost | share |
+|---|---|---|---|
+| cache **writes** — the new page, each step (1.25x) | 28,165 | $0.176 | **45%** |
+| **output** — thinking + the tool call (25x) | 5,400 | $0.135 | **34%** |
+| cache **reads** — the whole history (0.1x) | 162,635 | $0.081 | 21% |
+
+Resending the conversation is the *cheapest* part; caching already solved that.
+Trimming old history would save reads at $0.50/MTok and force rewrites at
+$6.25/MTok — a 12x loss. The two things that matter are **how much you send per
+step** and **how many steps need Claude at all**. Jev can help with both.
+
+### Jev's fast path
+
+Most browser steps are not reasoning. "The cookie banner is up, dismiss it."
+"The results are below, scroll." "That is obviously the Search button." Paying
+Opus to think about those is the waste.
+
+So Jev is asked, in the same `system_one` call it already makes, two more
+questions: *what is the obvious next move?* (`Choice` over click / scroll /
+go_back / ask_claude) and *which element?* (`Choice` over the live list). When
+it is confident on both, the step runs without a Claude turn at all.
+
+The proposal is **free** — it rides along in a request that was already
+happening, adding 1,291 tokens, $0.00065 across the whole task.
+
+Hard limits, because a confident wrong model is worse than a slow one:
+
+- **Only pure selections.** Jev cannot generate text, so typing a search query
+  is always Claude's. `AUTOPILOT_ACTIONS` has no `type_text` and a test asserts
+  it never will.
+- **80% confidence on both** the action and the element.
+- **Three consecutive steps** maximum, then Claude gets a turn regardless.
+- **Ordinary pages only** — a cookie wall, login or captcha hands back.
+- **The safety gate is not skipped.** Autopilot bypasses Claude, not the risk
+  score. Anything that would need your approval stops the run and hands back to
+  Claude rather than asking you out of context.
+
+Claude is told what happened in its absence (`Steps already taken for you: ...`),
+so the history stays honest.
+
+### Withholding the page text
+
+A third new question: *does this goal need the page's prose, or just its
+controls?* On a navigation step the 4,000-character text block is dead weight —
+one observation drops from 1,780 tokens to 1,222, **31% smaller**. Claude is
+told it was withheld and can call `extract_text` to fetch it. The text is kept
+on anything but a confident no, because a wrong drop costs quality.
+
+### What it adds up to
+
+Same twelve-step booking, same measured prompt sizes:
+
+| | Claude turns | cost | saved |
+|---|---|---|---|
+| Claude every step, full page text | 12 | $0.393 | — |
+| + withhold prose when navigational | 12 | $0.363 | 8% |
+| + Jev autopilot on 25% of steps | 9 | $0.263 | **33%** |
+| + Jev autopilot on 40% of steps | 7 | $0.200 | **49%** |
+| + Jev autopilot on 55% of steps | 5 | $0.142 | **64%** |
+| ...and on Sonnet 5 | 7 | $0.080 | **80%** |
+
+The saving beats the share of steps removed, because cost grows faster than
+linearly in turns — every turn you delete also stops resending history.
+
+Which rate you actually get depends on the site, so `/cost` tells you: compare
+`Claude turns` against the step count. Turn it off with
+`BROWSERUSE_FAST_PATH=0` and compare for yourself.
+
+### The other levers
+
+- `BROWSERUSE_MODEL=claude-sonnet-5` — 2.5x cheaper per token, and most browser
+  steps are not hard reasoning. **Do not mix models within one task**: caches
+  are model-scoped, so a per-step cascade forfeits cache reuse and can cost
+  more than it saves.
+- `BROWSERUSE_FAST_PATH_MAX=5` — longer autopilot runs, more saving, less
+  oversight.
 - Lower `BROWSERUSE_MAX_STEPS` to cap the worst case.
-- Give specific instructions. "Open google.com/travel/flights and search Vienna
-  to Lisbon for 18 Oct" costs a fraction of "book me a flight somewhere warm" —
-  the agent is not paying to explore.
-- Watch the cache hit rate in `/cost`. If it is near zero, something is
-  invalidating the prompt prefix and you are paying full price on every turn.
+- Be specific. "Open google.com/travel/flights, Vienna to Lisbon, 18 Oct" costs
+  a fraction of "book me a flight somewhere warm" — you are not paying the
+  agent to explore.
+- Watch the cache hit rate in `/cost`. Near zero means a prefix invalidator
+  crept in and every turn is at full price.
 
 Prices live in one table, `src/browseruse/agent/cost.py`, if they move.
 
@@ -259,14 +335,16 @@ pip install -e ".[dev]"
 pytest
 ```
 
-96 tests. The DOM and action tests drive a real headless Chromium against
+118 tests. The DOM and action tests drive a real headless Chromium against
 `tests/fixtures/shop.html` and are skipped if no Chromium is installed; the Jev
 tests run against a mocked API and assert the wire shapes (including that the
 element `Choice` never exceeds 255 labels); the loop tests run the full
 orchestration against a scripted Claude and a fake browser, covering the
 approval gate, declined actions, Jev outages and stale-index recovery; and
 `test_no_secret_leaks.py` asserts that no credential reaches either model, and
-`test_cost.py` pins the billing arithmetic against published rates.
+`test_cost.py` pins the billing arithmetic against published rates. The fast
+path has its own tests for every guard: the confidence floors, the consecutive
+cap, read-only mode, and that a risky step never autopilots past the gate.
 
 ## Known limits
 

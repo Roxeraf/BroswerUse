@@ -49,6 +49,19 @@ PAGE_STATES: dict[str, str] = {
 }
 
 
+#: Actions Jev may take on its own. Everything here is a pure selection: no
+#: text has to be generated, which is precisely what a System One model cannot
+#: do. Typing a search query is therefore always Claude's job.
+AUTOPILOT_ACTIONS: dict[str, str] = {
+    "click": "Click one element on the page -- a link, a button, a filter, a result.",
+    "scroll": "Scroll further down the page; what is needed is below the fold.",
+    "go_back": "Return to the previous page; this one was a dead end.",
+    "ask_claude": "Anything else: typing text, choosing between real alternatives, "
+    "reading and summarising, deciding the plan, or any step where the right move "
+    "is not obvious from the page alone.",
+}
+
+
 @dataclass(frozen=True)
 class Observation:
     """What Jev thinks about the page the agent is looking at."""
@@ -56,11 +69,44 @@ class Observation:
     page_state: str
     page_state_confidence: float
     goal_complete: float
+    #: Probability the goal needs the page's prose, not just its controls.
+    needs_page_text: float = 1.0
+    #: Jev's own read of the next move, when it was asked for one.
+    next_action: str = "ask_claude"
+    next_action_confidence: float = 0.0
+    next_element: int | None = None
+    next_element_confidence: float = 0.0
 
     @property
     def blocked_on_human(self) -> bool:
         """Login walls and captchas are yours to solve, not the agent's."""
         return self.page_state in {"login_required", "captcha"}
+
+    @property
+    def wants_page_text(self) -> bool:
+        """Withhold the prose only on a confident no -- a wrong drop costs quality."""
+        return self.needs_page_text >= 0.25
+
+    def autopilot_move(self, min_confidence: float) -> tuple[str, dict] | None:
+        """The action Jev is confident enough to take without asking Claude.
+
+        Everything has to line up: an ordinary page, a goal that is not already
+        met, an action Jev can actually express, and confidence on both the
+        action and -- where one is needed -- the element.
+        """
+        if self.page_state != "normal" or self.goal_complete >= 0.5:
+            return None
+        if self.next_action == "ask_claude" or self.next_action_confidence < min_confidence:
+            return None
+        if self.next_action == "scroll":
+            return "scroll", {"direction": "down", "amount": 700}
+        if self.next_action == "go_back":
+            return "go_back", {}
+        if self.next_action == "click":
+            if self.next_element is None or self.next_element_confidence < min_confidence:
+                return None
+            return "click", {"index": self.next_element}
+        return None
 
 
 @dataclass(frozen=True)
@@ -97,8 +143,15 @@ class JevAdvisor:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def observe(self, goal: str, snapshot: PageSnapshot) -> Observation:
-        """Classify the page and check for completion in a single request."""
+    async def observe(
+        self, goal: str, snapshot: PageSnapshot, *, propose_next: bool = False
+    ) -> Observation:
+        """Everything Jev can tell us about this page, in one request.
+
+        ``system_one`` answers a whole mapping of named questions at once, so
+        asking what to do next and whether the prose is needed costs the same
+        one call as classifying the page did.
+        """
         state = {
             "goal": goal,
             "url": snapshot.url,
@@ -106,28 +159,67 @@ class JevAdvisor:
             "visible_text": snapshot.text[:2000],
             "elements": [el.describe() for el in snapshot.elements[:60]],
         }
-        result = await self._ask(
-            state,
-            {
-                "page_state": Choice(
-                    instructions="What is the state of this page right now?",
-                    criteria=dict(PAGE_STATES),
-                ),
-                "goal_complete": Noul(
-                    instructions="The user's goal has already been achieved and is "
-                    "visible on this page.",
-                    criteria={
-                        "true": "The page shows the finished result the goal asked for.",
-                        "false": "More steps are still needed.",
-                    },
-                ),
-            },
-        )
-        choice = result.choices["page_state"]
+        questions: dict[str, Any] = {
+            "page_state": Choice(
+                instructions="What is the state of this page right now?",
+                criteria=dict(PAGE_STATES),
+            ),
+            "goal_complete": Noul(
+                instructions="The user's goal has already been achieved and is "
+                "visible on this page.",
+                criteria={
+                    "true": "The page shows the finished result the goal asked for.",
+                    "false": "More steps are still needed.",
+                },
+            ),
+            "needs_page_text": Noul(
+                instructions="Achieving this goal requires reading the page's written "
+                "content, not just operating its buttons and links.",
+                criteria={
+                    "true": "The answer is in the page's text: prices, descriptions, "
+                    "results, an article, a confirmation number.",
+                    "false": "This is a navigation step -- the labels on the controls "
+                    "are enough to decide what to press next.",
+                },
+            ),
+        }
+        labels = snapshot.choice_labels()
+        if propose_next and labels:
+            questions["next_action"] = Choice(
+                instructions="What is the single obvious next move towards the goal? "
+                "Choose ask_claude unless the move is unambiguous from this page alone.",
+                criteria=dict(AUTOPILOT_ACTIONS),
+            )
+            questions["next_element"] = Choice(
+                instructions="If the next move is a click, which element should be clicked?",
+                criteria=labels,
+            )
+
+        result = await self._ask(state, questions)
+        page_state = result.choices["page_state"]
+
+        next_action, action_confidence = "ask_claude", 0.0
+        next_element: int | None = None
+        element_confidence = 0.0
+        if "next_action" in result.choices:
+            action_answer = result.choices["next_action"]
+            next_action, action_confidence = action_answer.choice, action_answer.confidence
+            element_answer = result.choices["next_element"]
+            element_confidence = element_answer.confidence
+            try:
+                next_element = int(element_answer.choice)
+            except ValueError:
+                next_element = None
+
         return Observation(
-            page_state=choice.choice,
-            page_state_confidence=choice.confidence,
+            page_state=page_state.choice,
+            page_state_confidence=page_state.confidence,
             goal_complete=result.nouls["goal_complete"].noul,
+            needs_page_text=result.nouls["needs_page_text"].noul,
+            next_action=next_action,
+            next_action_confidence=action_confidence,
+            next_element=next_element,
+            next_element_confidence=element_confidence,
         )
 
     async def assess_risk(
