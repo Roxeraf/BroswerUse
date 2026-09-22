@@ -14,9 +14,11 @@ from rich.table import Table
 
 from browseruse.agent.jev import JevAdvisor
 from browseruse.agent.loop import BrowserAgent
+from browseruse.agent.replay import RecipeRunner
 from browseruse.browser.launcher import BrowserLaunchError
 from browseruse.browser.session import BrowserSession
 from browseruse.config import Config
+from browseruse.recipes import Recipe, RecipeBook, learn
 from browseruse.safety import Judgement
 
 console = Console()
@@ -32,6 +34,12 @@ Commands
   /readonly          toggle read-only mode (every click needs a yes)
   /risk <0-3>        set the confirmation threshold (default 1.5)
   /cost              what this session has spent so far
+
+Learned procedures
+  /learn <name>      remember the last successful task under this name
+  /recipes           list what has been learned
+  /run <name> [k=v]  repeat a procedure from memory, without asking Claude
+  /forget <name>     delete one
   /browser           show which browser is attached
   /help              this text
   /quit              detach and exit
@@ -118,12 +126,80 @@ async def _show_tabs(session: BrowserSession) -> None:
     console.print(table)
 
 
-async def _handle_command(line: str, session: BrowserSession, agent: BrowserAgent, config: Config) -> bool:
+async def _show_recipes(book: RecipeBook) -> None:
+    recipes = book.all()
+    if not recipes:
+        console.print(
+            "  [dim]Nothing learned yet. Finish a task, then /learn <name> to keep it.[/dim]"
+        )
+        return
+    for recipe in recipes:
+        console.print(f"  {recipe.summary()}")
+
+
+async def _replay(
+    runner: RecipeRunner, book: RecipeBook, recipe: Recipe, parameters: dict[str, str],
+    agent: BrowserAgent,
+) -> None:
+    console.print(f"\n[dim]Replaying {recipe.name} -- {len(recipe.steps)} remembered steps[/dim]")
+    report = await runner.run(recipe, parameters)
+    book.record_run(recipe, succeeded=report.ok)
+
+    if report.ok:
+        console.print(Panel(
+            f"{report.reason} {report.completed}/{report.total} steps, no Claude turns.\n"
+            f"[dim]cost {report.cost.one_line() if report.cost else ''}[/dim]",
+            border_style="green", expand=False))
+        return
+
+    console.print(Panel(
+        f"Stopped at step {report.completed + 1} of {report.total}.\n{report.reason}",
+        title="[yellow]Recipe no longer fits[/yellow]", border_style="yellow", expand=False))
+    if await asyncio.to_thread(Confirm.ask, "  Let Claude do it instead?", default=True):
+        await _do_task(agent, recipe.goal)
+
+
+async def _handle_command(
+    line: str, session: BrowserSession, agent: BrowserAgent, config: Config,
+    book: RecipeBook, runner: RecipeRunner, memory: dict,
+) -> bool:
     """Returns False when the user asked to quit."""
     command, _, rest = line[1:].partition(" ")
     rest = rest.strip()
 
     match command:
+        case "learn":
+            if not rest:
+                console.print("[yellow]Usage: /learn <name>[/yellow]")
+            elif not memory.get("steps"):
+                console.print("[yellow]Nothing to learn -- finish a task first.[/yellow]")
+            else:
+                recipe = learn(rest, memory["goal"], memory["steps"])
+                if not recipe.steps:
+                    console.print("[yellow]That run had no repeatable steps.[/yellow]")
+                else:
+                    path = book.save(recipe)
+                    console.print(
+                        f"  Learned [bold]{recipe.name}[/bold]: {len(recipe.steps)} steps.\n"
+                        f"  [dim]{path}  -- edit it to add {{{{placeholders}}}}[/dim]"
+                    )
+        case "recipes":
+            await _show_recipes(book)
+        case "run":
+            name, *pairs = rest.split() or [""]
+            recipe = book.load(name) if name else None
+            if recipe is None:
+                console.print(f"[yellow]No recipe called {name!r}. Try /recipes.[/yellow]")
+            else:
+                parameters = dict(
+                    pair.split("=", 1) for pair in pairs if "=" in pair
+                )
+                await _replay(runner, book, recipe, parameters, agent)
+        case "forget":
+            console.print(
+                f"  Forgot [bold]{rest}[/bold]." if book.delete(rest)
+                else f"[yellow]No recipe called {rest!r}.[/yellow]"
+            )
         case "quit" | "exit" | "q":
             return False
         case "help" | "h":
@@ -187,6 +263,13 @@ async def _run(args: argparse.Namespace) -> int:
 
     agent = BrowserAgent(config, session, jev, approve=_ask_approval, report=_reporter)
     agent.read_only_mode = args.read_only
+    book = RecipeBook(config.state_dir / "recipes")
+    runner = RecipeRunner(
+        config, session, jev, approve=_ask_approval, report=_reporter, meter=agent.meter
+    )
+    runner.read_only_mode = args.read_only
+    #: The last task that finished, so /learn has something to remember.
+    memory: dict = {}
 
     console.print(
         Panel(
@@ -194,7 +277,8 @@ async def _run(args: argparse.Namespace) -> int:
             f"Jev: {'on' if jev else 'off'}"
             f"{' (autopilot)' if jev and config.fast_path else ''}   "
             f"Confirm at risk >= {config.risk_threshold}   "
-            f"Read-only: {'on' if agent.read_only_mode else 'off'}\n\n"
+            f"Read-only: {'on' if agent.read_only_mode else 'off'}   "
+            f"Recipes: {len(book.all())}\n\n"
             "[dim]/help for commands, /quit to leave.[/dim]",
             title="browseruse",
             border_style="cyan",
@@ -204,7 +288,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     try:
         if args.task:
-            await _do_task(agent, " ".join(args.task))
+            await _do_task(agent, " ".join(args.task), memory)
             return 0
 
         while True:
@@ -215,10 +299,12 @@ async def _run(args: argparse.Namespace) -> int:
             if not line:
                 continue
             if line.startswith("/"):
-                if not await _handle_command(line, session, agent, config):
+                if not await _handle_command(
+                    line, session, agent, config, book, runner, memory
+                ):
                     break
                 continue
-            await _do_task(agent, line)
+            await _do_task(agent, line, memory)
     finally:
         await session.close()
         if jev is not None:
@@ -231,7 +317,7 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _do_task(agent: BrowserAgent, goal: str) -> None:
+async def _do_task(agent: BrowserAgent, goal: str, memory: dict | None = None) -> None:
     console.print()
     try:
         report = await agent.run(goal)
@@ -241,6 +327,8 @@ async def _do_task(agent: BrowserAgent, goal: str) -> None:
     except Exception as exc:  # noqa: BLE001 - the REPL must survive a bad task
         console.print(f"\n[red]{type(exc).__name__}: {exc}[/red]")
         return
+    if memory is not None and report.stopped_because == "done":
+        memory["goal"], memory["steps"] = goal, report.steps
     console.print()
     console.print(Panel(report.summary, border_style="green", expand=False))
     trailer = []

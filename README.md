@@ -83,6 +83,7 @@ browseruse --read-only                  # navigate freely, confirm every click
 ```
 
 Commands inside the chat: `/tabs`, `/goto <url>`, `/readonly`, `/risk <0-3>`, `/cost`,
+`/learn`, `/recipes`, `/run`, `/forget`,
 `/browser`, `/help`, `/quit`.
 
 ### Which profile it uses
@@ -371,6 +372,73 @@ One finding worth repeating: `test_actions.py` used a **stub** session, and
 that stub is precisely what hid the `target="_blank"` bug — it had no concept
 of tabs. Those tests now drive the real `BrowserSession`.
 
+## Learned procedures
+
+The gap between an agent and an assistant is not intelligence. It is that an
+assistant **remembers how you do things**. A one-off agent re-derives every
+task from scratch and pays a model call per step to do it.
+
+Finish a task, then name it:
+
+```
+you> open my github notifications and tell me which mention me
+  ...
+you> /learn check github
+  Learned check github: 4 steps.
+
+you> /run check github
+  ~> navigate -> https://github.com/notifications
+  ~> click -> [31] "Notifications" (94% match)
+  Replayed from memory. 4/4 steps, no Claude turns.
+```
+
+### Why this works at all
+
+Element indices are meaningless across runs — `[12]` is the notifications link
+today and a cookie button tomorrow. So a recipe stores **no indices**. It
+stores the *intent*: the `target_description` Claude already writes for every
+action. On replay, Jev's `Choice` resolves that description against the live
+page, which is the same trick that recovers from index drift mid-run.
+
+| | cost | wall clock |
+|---|---|---|
+| re-deriving a 12-step task with Claude | $0.393 | ~60s |
+| replaying it from memory | **$0.00093** | ~7s |
+
+**422x cheaper.** A hundred runs a month goes from $39 to nine cents, because
+the only spend is Jev matching intents to elements.
+
+### What a recipe cannot do
+
+**It can never launder an approval.** A step that needed your yes when it was
+learned asks again on every single replay, forever — that flag is stored and
+enforced, and there is a test that fails if it ever stops being. "I approved it
+once" must not quietly become "it does this unattended".
+
+Replay also runs the **live** risk score, not the remembered one. A step that
+was harmless when learned and is consequential today gets gated today.
+
+And it gives up rather than improvising. If Jev cannot match a remembered step
+to the current page with 70% confidence, replay **stops** and offers to hand
+the goal to Claude. A recipe that confidently clicks the wrong thing is worse
+than no recipe.
+
+### Parameters
+
+Recipes are plain JSON in `~/.browseruse/recipes/`. Edit one, replace a literal
+with `{{city}}`, and it becomes reusable:
+
+```
+you> /run flight-search origin=Vienna destination=Lisbon
+```
+
+Running a recipe without a value it needs stops before anything happens and
+tells you what is missing.
+
+Commands: `/learn <name>`, `/recipes`, `/run <name> [k=v]`, `/forget <name>`.
+`/recipes` shows each one's success rate, so a procedure that a site has
+outgrown is visible rather than silently flaky.
+
 ## Tests
 
 ```bash
@@ -378,7 +446,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-124 tests. The DOM and action tests drive a real headless Chromium against
+150 tests. The DOM and action tests drive a real headless Chromium against
 `tests/fixtures/shop.html` and are skipped if no Chromium is installed; the Jev
 tests run against a mocked API and assert the wire shapes (including that the
 element `Choice` never exceeds 255 labels); the loop tests run the full
@@ -389,7 +457,8 @@ approval gate, declined actions, Jev outages and stale-index recovery; and
 path has its own tests for every guard: the confidence floors, the consecutive
 cap, read-only mode, and that a risky step never autopilots past the gate.
 `test_settling.py` covers the async re-render, the never-settling page, and the
-new-tab follow.
+new-tab follow; `test_recipes.py` and `test_replay.py` cover learning, storage
+and every way a replay must refuse to improvise.
 
 ## Known limits
 
